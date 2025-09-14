@@ -887,7 +887,8 @@ function Update-PSSignedBuildFolder
         [string]$BuildPath,
         [Parameter(Mandatory)]
         [string]$SignedFilesPath,
-        [string[]] $RemoveFilter = ('*.pdb', '*.zip', '*.r2rmap')
+        [string[]] $RemoveFilter = ('*.pdb', '*.zip', '*.r2rmap'),
+        [bool]$OfficialBuild = $true
     )
 
     $BuildPathNormalized = (Get-Item $BuildPath).FullName
@@ -943,8 +944,21 @@ function Update-PSSignedBuildFolder
         if ($IsWindows)
         {
             $signature = Get-AuthenticodeSignature -FilePath $signedFilePath
-            if ($signature.Status -ne 'Valid') {
+
+            if ($signature.Status -ne 'Valid' -and $OfficialBuild) {
+                Write-Host "Certificate Issuer: $($signature.SignerCertificate.Issuer)"
+                Write-Host "Certificate Subject: $($signature.SignerCertificate.Subject)"
                 Write-Error "Invalid signature for $signedFilePath"
+            } elseif ($OfficialBuild -eq $false) {
+                if ($signature.Status -eq 'NotSigned') {
+                    Write-Warning "File is not signed: $signedFilePath"
+                } elseif ($signature.SignerCertificate.Issuer -notmatch '^CN=(Microsoft|TestAzureEngBuildCodeSign|Windows Internal Build Tools).*') {
+                    Write-Warning "File signed with test certificate: $signedFilePath"
+                    Write-Host "Certificate Issuer: $($signature.SignerCertificate.Issuer)"
+                    Write-Host "Certificate Subject: $($signature.SignerCertificate.Subject)"
+                } else {
+                    Write-Verbose -Verbose "File properly signed: $signedFilePath"
+                }
             }
         }
         else
@@ -1598,7 +1612,7 @@ function Get-PackageDependencies
                 "libgssapi-krb5-2",
                 "libstdc++6",
                 "zlib1g",
-                "libicu74|libicu72|libicu71|libicu70|libicu69|libicu68|libicu67|libicu66|libicu65|libicu63|libicu60|libicu57|libicu55|libicu52",
+                "libicu76|libicu74|libicu72|libicu71|libicu70|libicu69|libicu68|libicu67|libicu66|libicu65|libicu63|libicu60|libicu57|libicu55|libicu52",
                 "libssl3|libssl1.1|libssl1.0.2|libssl1.0.0"
             )
 
@@ -3707,8 +3721,17 @@ function New-MSIXPackage
 
     $ProductVersion = Get-WindowsVersion -PackageName $packageName
 
+    # Any app that is submitted to the Store must have a PhoneIdentity in its appxmanifest.
+    # If you submit a package without this information to the Store, the Store will silently modify your package to include it.
+    # To find the PhoneProductId value, you need to run a package through the Store certification process,
+    # and use the PhoneProductId value from the Store certified package to update the manifest in your source code.
+    # This is the PhoneProductId for the "Microsoft.PowerShell" package.
+    $PhoneProductId = "5b3ae196-2df7-446e-8060-94b4ad878387"
+
     $isPreview = Test-IsPreview -Version $ProductSemanticVersion
     if ($isPreview) {
+        # This is the PhoneProductId for the "Microsoft.PowerShellPreview" package.
+        $PhoneProductId = "67859fd2-b02a-45be-8fb5-62c569a3e8bf"
         Write-Verbose "Using Preview assets" -Verbose
     }
 
@@ -3718,7 +3741,14 @@ function New-MSIXPackage
     $releasePublisher = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'
 
     $appxManifest = Get-Content "$RepoRoot\assets\AppxManifest.xml" -Raw
-    $appxManifest = $appxManifest.Replace('$VERSION$', $ProductVersion).Replace('$ARCH$', $Architecture).Replace('$PRODUCTNAME$', $productName).Replace('$DISPLAYNAME$', $displayName).Replace('$PUBLISHER$', $releasePublisher)
+    $appxManifest = $appxManifest.
+        Replace('$VERSION$', $ProductVersion).
+        Replace('$ARCH$', $Architecture).
+        Replace('$PRODUCTNAME$', $productName).
+        Replace('$DISPLAYNAME$', $displayName).
+        Replace('$PUBLISHER$', $releasePublisher).
+        Replace('$PHONEPRODUCTID$', $PhoneProductId)
+
     $xml = [xml]$appxManifest
     if ($isPreview) {
         Write-Verbose -Verbose "Adding pwsh-preview.exe alias"

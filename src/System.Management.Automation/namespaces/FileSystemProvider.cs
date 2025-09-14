@@ -1324,6 +1324,7 @@ namespace Microsoft.PowerShell.Commands
             if (ShouldProcess(resource, action))
             {
                 var invokeProcess = new System.Diagnostics.Process();
+                // codeql[cs/microsoft/command-line-injection-shell-execution] - This is expected Poweshell behavior where user inputted paths are supported for the context of this method. The user assumes trust for the file path they are specifying. If there is concern for remoting, restricted remoting guidelines should be used.
                 invokeProcess.StartInfo.FileName = path;
 #if UNIX
                 bool useShellExecute = false;
@@ -2665,12 +2666,6 @@ namespace Microsoft.PowerShell.Commands
                 !string.IsNullOrEmpty(path),
                 "The caller should verify path");
 
-            // Get the parent path
-            string parentPath = GetParentPath(path, null);
-
-            // The directory name
-            string childName = GetChildName(path);
-
             ErrorRecord error = null;
             if (!Force && ItemExists(path, out error))
             {
@@ -2700,7 +2695,7 @@ namespace Microsoft.PowerShell.Commands
 
                 if (ShouldProcess(resource, action))
                 {
-                    var result = Directory.CreateDirectory(Path.Combine(parentPath, childName));
+                    var result = Directory.CreateDirectory(path);
 
                     if (streamOutput)
                     {

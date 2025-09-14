@@ -64,7 +64,6 @@ namespace System.Management.Automation
         /// <param name="moduleName"></param>
         /// <param name="commandTypes"></param>
         /// <returns></returns>
-        [SuppressMessage("Microsoft.Design", "CA1026:DefaultParametersShouldNotBeUsed")]
         public static IEnumerable<CompletionResult> CompleteCommand(string commandName, string moduleName, CommandTypes commandTypes = CommandTypes.All)
         {
             var runspace = Runspace.DefaultRunspace;
@@ -499,11 +498,16 @@ namespace System.Management.Automation
                     nestedModulesToFilterOut = new(currentModule.NestedModules);
                 }
 
+                var completedModules = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (PSObject item in psObjects)
                 {
                     var moduleInfo = (PSModuleInfo)item.BaseObject;
                     var completionText = moduleInfo.Name;
-                    var listItemText = completionText;
+                    if (!completedModules.Add(completionText))
+                    {
+                        continue;
+                    }
+
                     if (shortNameSearch
                         && completionText.Contains('.')
                         && !shortNamePattern.IsMatch(completionText.Substring(completionText.LastIndexOf('.') + 1))
@@ -526,7 +530,7 @@ namespace System.Management.Automation
 
                     completionText = CompletionHelpers.QuoteCompletionText(completionText, quote);
 
-                    result.Add(new CompletionResult(completionText, listItemText, CompletionResultType.ParameterValue, toolTip));
+                    result.Add(new CompletionResult(completionText, listItemText: moduleInfo.Name, CompletionResultType.ParameterValue, toolTip));
                 }
             }
 
@@ -665,6 +669,11 @@ namespace System.Management.Automation
         {
             Diagnostics.Assert(bindingInfo.InfoType.Equals(PseudoBindingInfoType.PseudoBindingSucceed), "The pseudo binding should succeed");
             List<CompletionResult> result = new List<CompletionResult>();
+            Assembly commandAssembly = null;
+            if (bindingInfo.CommandInfo is CmdletInfo cmdletInfo)
+            {
+                commandAssembly = cmdletInfo.CommandMetadata.CommandType.Assembly;
+            }
 
             if (parameterName == string.Empty)
             {
@@ -672,7 +681,8 @@ namespace System.Management.Automation
                     parameterName,
                     bindingInfo.ValidParameterSetsFlags,
                     bindingInfo.UnboundParameters,
-                    withColon);
+                    withColon,
+                    commandAssembly);
                 return result;
             }
 
@@ -694,7 +704,8 @@ namespace System.Management.Automation
                         parameterName,
                         bindingInfo.ValidParameterSetsFlags,
                         bindingInfo.UnboundParameters,
-                        withColon);
+                        withColon,
+                        commandAssembly);
                 }
 
                 return result;
@@ -709,7 +720,8 @@ namespace System.Management.Automation
                         parameterName,
                         bindingInfo.ValidParameterSetsFlags,
                         bindingInfo.BoundParameters.Values,
-                        withColon);
+                        withColon,
+                        commandAssembly);
                 }
 
                 return result;
@@ -773,7 +785,8 @@ namespace System.Management.Automation
                     parameterName,
                     bindingInfo.ValidParameterSetsFlags,
                     bindingInfo.UnboundParameters,
-                    withColon);
+                    withColon,
+                    commandAssembly);
                 return result;
             }
 
@@ -781,11 +794,25 @@ namespace System.Management.Automation
 
             WildcardPattern pattern = WildcardPattern.Get(parameterName + "*", WildcardOptions.IgnoreCase);
             string parameterType = "[" + ToStringCodeMethods.Type(param.Parameter.Type, dropNamespaces: true) + "] ";
+
+            string helpMessage = string.Empty;
+            if (param.Parameter.CompiledAttributes is not null)
+            {
+                foreach (Attribute attr in param.Parameter.CompiledAttributes)
+                {
+                    if (attr is ParameterAttribute pattr && TryGetParameterHelpMessage(pattr, commandAssembly, out string attrHelpMessage))
+                    {
+                        helpMessage = $" - {attrHelpMessage}";
+                        break;
+                    }
+                }
+            }
+
             string colonSuffix = withColon ? ":" : string.Empty;
             if (pattern.IsMatch(matchedParameterName))
             {
-                string completionText = "-" + matchedParameterName + colonSuffix;
-                string tooltip = parameterType + matchedParameterName;
+                string completionText = $"-{matchedParameterName}{colonSuffix}";
+                string tooltip = $"{parameterType}{matchedParameterName}{helpMessage}";
                 result.Add(new CompletionResult(completionText, matchedParameterName, CompletionResultType.ParameterName, tooltip));
             }
             else
@@ -799,13 +826,51 @@ namespace System.Management.Automation
                             $"-{alias}{colonSuffix}",
                             alias,
                             CompletionResultType.ParameterName,
-                            parameterType + alias));
+                            $"{parameterType}{alias}{helpMessage}"));
                     }
                 }
             }
 
             return result;
         }
+
+#nullable enable
+        /// <summary>
+        /// Try and get the help message text for the parameter attribute.
+        /// </summary>
+        /// <param name="attr">The attribute to check for the help message.</param>
+        /// <param name="assembly">The assembly to lookup resources messages, this should be the assembly the cmdlet is defined in.</param>
+        /// <param name="message">The help message if it was found otherwise null.</param>
+        /// <returns>True if the help message was set or false if not.></returns>
+        private static bool TryGetParameterHelpMessage(
+            ParameterAttribute attr,
+            Assembly? assembly,
+            [NotNullWhen(true)] out string? message)
+        {
+            message = null;
+            
+            if (attr.HelpMessage is not null)
+            {
+                message = attr.HelpMessage;
+                return true;
+            }
+
+            if (assembly is null || attr.HelpMessageBaseName is null || attr.HelpMessageResourceId is null)
+            {
+                return false;
+            }
+
+            try
+            {
+                message = ResourceManagerCache.GetResourceString(assembly, attr.HelpMessageBaseName, attr.HelpMessageResourceId);
+                return message is not null;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+#nullable disable
 
         /// <summary>
         /// Get the parameter completion results by using the given valid parameter sets and available parameters.
@@ -814,12 +879,14 @@ namespace System.Management.Automation
         /// <param name="validParameterSetFlags"></param>
         /// <param name="parameters"></param>
         /// <param name="withColon"></param>
+        /// <param name="commandAssembly">Optional assembly used to lookup parameter help messages.</param>
         /// <returns></returns>
         private static List<CompletionResult> GetParameterCompletionResults(
             string parameterName,
             uint validParameterSetFlags,
             IEnumerable<MergedCompiledCommandParameter> parameters,
-            bool withColon)
+            bool withColon,
+            Assembly commandAssembly = null)
         {
             var result = new List<CompletionResult>();
             var commonParamResult = new List<CompletionResult>();
@@ -835,6 +902,7 @@ namespace System.Management.Automation
 
                 string name = param.Parameter.Name;
                 string type = "[" + ToStringCodeMethods.Type(param.Parameter.Type, dropNamespaces: true) + "] ";
+                string helpMessage = null;
                 bool isCommonParameter = Cmdlet.CommonParameters.Contains(name, StringComparer.OrdinalIgnoreCase);
                 List<CompletionResult> listInUse = isCommonParameter ? commonParamResult : result;
 
@@ -850,20 +918,27 @@ namespace System.Management.Automation
                     {
                         foreach (var attr in compiledAttributes)
                         {
-                            var pattr = attr as ParameterAttribute;
-                            if (pattr != null && pattr.DontShow)
+                            if (attr is ParameterAttribute pattr)
                             {
-                                showToUser = false;
-                                addCommonParameters = false;
-                                break;
+                                if (pattr.DontShow)
+                                {
+                                    showToUser = false;
+                                    addCommonParameters = false;
+                                    break;
+                                }
+                                
+                                if (helpMessage is null && TryGetParameterHelpMessage(pattr, commandAssembly, out string attrHelpMessage))
+                                {
+                                    helpMessage = $" - {attrHelpMessage}";
+                                }
                             }
                         }
                     }
 
                     if (showToUser)
                     {
-                        string completionText = "-" + name + colonSuffix;
-                        string tooltip = type + name;
+                        string completionText = $"-{name}{colonSuffix}";
+                        string tooltip = $"{type}{name}{helpMessage}";
                         listInUse.Add(new CompletionResult(completionText, name, CompletionResultType.ParameterName,
                                                            tooltip));
                     }
@@ -2562,9 +2637,8 @@ namespace System.Management.Automation
                 }
             }
 
-            var registeredCompleters = optionKey.Equals("NativeArgumentCompleters", StringComparison.OrdinalIgnoreCase)
-                ? context.NativeArgumentCompleters
-                : context.CustomArgumentCompleters;
+            bool isNative = optionKey.Equals("NativeArgumentCompleters", StringComparison.OrdinalIgnoreCase);
+            var registeredCompleters = isNative ? context.NativeArgumentCompleters : context.CustomArgumentCompleters;
 
             if (registeredCompleters != null)
             {
@@ -2574,6 +2648,13 @@ namespace System.Management.Automation
                     {
                         return scriptBlock;
                     }
+                }
+
+                // For a native command, if a fallback completer is registered, then return it.
+                // For example, the 'Microsoft.PowerShell.UnixTabCompletion' module.
+                if (isNative && registeredCompleters.TryGetValue(RegisterArgumentCompleterCommand.FallbackCompleterKey, out scriptBlock))
+                {
+                    return scriptBlock;
                 }
             }
 
@@ -5038,14 +5119,24 @@ namespace System.Management.Automation
                     break;
 
                 default:
-                    // Handle all the different quote types
-                    if (useSingleQuoteEscapeRules && path[index].IsSingleQuote())
+                    if (useSingleQuoteEscapeRules)
                     {
-                        _ = sb.Append('\'');
-                        quotesAreNeeded = true;
+                        // Bareword or singlequoted input string.
+                        if (path[index].IsSingleQuote())
+                        {
+                            // SingleQuotes are escaped with more single quotes. quotesAreNeeded is set so bareword strings can quoted.
+                            _ = sb.Append('\'');
+                            quotesAreNeeded = true;
+                        }
+                        else if (!quotesAreNeeded && stringType == StringConstantType.BareWord && path[index].IsDoubleQuote())
+                        {
+                            // Bareword string with double quote inside. Make sure to quote it so we don't need to escape it.
+                            quotesAreNeeded = true;
+                        }
                     }
-                    else if (!useSingleQuoteEscapeRules && path[index].IsDoubleQuote())
+                    else if (path[index].IsDoubleQuote())
                     {
+                        // Double quoted or bareword with variables input string. Need to escape double quotes.
                         _ = sb.Append('`');
                         quotesAreNeeded = true;
                     }
